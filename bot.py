@@ -114,7 +114,7 @@ def _today_str() -> str:
 
 def _day_bounds(date_str: str):
     """Returns (start_rfc, end_rfc) for a full day in Argentina timezone."""
-    day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=TZ_ARG)
+    day = TZ_ARG.localize(datetime.strptime(date_str, "%Y-%m-%d"))
     start = day.isoformat()
     end = (day + timedelta(days=1)).isoformat()
     return start, end
@@ -169,7 +169,7 @@ def cal_create_event(nombre: str, fecha: str, hora: str | None = None) -> dict:
     svc = _calendar_service()
     if hora:
         dt_str = f"{fecha}T{hora}:00"
-        dt_start = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=TZ_ARG)
+        dt_start = TZ_ARG.localize(datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S"))
         dt_end = dt_start + timedelta(hours=1)
         event_body = {
             "summary": nombre,
