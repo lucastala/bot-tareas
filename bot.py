@@ -290,7 +290,9 @@ def openai_process(user_text: str) -> str:
             "role": "system",
             "content": (
                 f"Sos un asistente personal. Hoy es {today} (zona horaria America/Argentina/Buenos_Aires). "
-                "Usá las herramientas disponibles para responder. Respondé siempre en español, de forma concisa."
+                "Usá las herramientas disponibles para responder. Respondé siempre en español, de forma concisa. "
+                "Cuando creés un evento y el usuario dice una hora en punto ('a las 4', 'a las 10'), "
+                "usá siempre :00 como minutos (ej: 16:00, 10:00). Nunca uses los minutos actuales del reloj."
             ),
         },
         {"role": "user", "content": user_text},
