@@ -109,15 +109,15 @@ def build_calendar_keyboard(task_id: str, year: int, month: int) -> InlineKeyboa
     ])
     rows.append([InlineKeyboardButton(d, callback_data="calIgnore")
                  for d in ["Lu", "Ma", "Mi", "Ju", "Vi", "Sa", "Do"]])
-    today = datetime.now(TZ_ARG).date()
+    now = datetime.now(TZ_ARG)
     for week in cal_module.monthcalendar(year, month):
         row = []
         for day in week:
             if day == 0:
                 row.append(InlineKeyboardButton(" ", callback_data="calIgnore"))
             else:
-                d = date(year, month, day)
-                label = f"[{day}]" if d == today else str(day)
+                is_today = (day == now.day and month == now.month and year == now.year)
+                label = f"[{day}]" if is_today else str(day)
                 row.append(InlineKeyboardButton(
                     label, callback_data=f"calDay_{task_id}_{year}-{month:02d}-{day:02d}"
                 ))
