@@ -48,6 +48,20 @@ TZ_ARG = pytz.timezone("America/Argentina/Buenos_Aires")
 def escape_md(text: str) -> str:
     return re.sub(r'([_*\[\]()~`>#+=|{}.!\-])', r'\\\1', str(text))
 
+DIAS_ES   = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+MESES_ES  = ["", "ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
+
+def format_fecha_display(fecha_str: str) -> str:
+    try:
+        d = datetime.strptime(fecha_str, "%Y-%m-%d").date()
+        hoy = datetime.now(TZ_ARG).date()
+        nombre = DIAS_ES[d.weekday()]
+        if d.month == hoy.month and d.year == hoy.year:
+            return f"{nombre} {d.day}"
+        return f"{nombre} {d.day} {MESES_ES[d.month]}"
+    except Exception:
+        return fecha_str
+
 # ── Google clients ────────────────────────────────────────────────────────────
 _SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -103,7 +117,7 @@ def build_calendar_keyboard(task_id: str, year: int, month: int) -> InlineKeyboa
                 row.append(InlineKeyboardButton(" ", callback_data="calIgnore"))
             else:
                 d = date(year, month, day)
-                label = f"·{day}·" if d == today else str(day)
+                label = f"[{day}]" if d == today else str(day)
                 row.append(InlineKeyboardButton(
                     label, callback_data=f"calDay_{task_id}_{year}-{month:02d}-{day:02d}"
                 ))
@@ -388,12 +402,7 @@ def build_tasks_footer() -> str:
         lines = ["📋 *Tareas pendientes:*"]
         for i, t in enumerate(tasks_sorted, 1):
             fecha = str(t.get("fecha", "")).strip()
-            fecha_str = ""
-            if fecha:
-                try:
-                    fecha_str = " — " + datetime.strptime(fecha, "%Y-%m-%d").strftime("%d/%m")
-                except Exception:
-                    fecha_str = f" — {fecha}"
+            fecha_str = f" — {format_fecha_display(fecha)}" if fecha else ""
             lines.append(f"{i}\\. {escape_md(t['tarea'])}{escape_md(fecha_str)}")
     lines.append("")
     lines.append("_Usá \\.texto para agregar tarea\\. Usá \\.número para eliminar\\._")
@@ -474,8 +483,7 @@ async def handle_cal_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_id, fecha_val = parts[1], parts[2]
         if fecha_val != "ninguna":
             sheets_update_fecha(task_id, fecha_val)
-            d = datetime.strptime(fecha_val, "%Y-%m-%d")
-            msg = f"✅ Fecha límite: {escape_md(d.strftime('%d/%m'))}\n\n"
+            msg = f"✅ Fecha límite: {escape_md(format_fecha_display(fecha_val))}\n\n"
         else:
             msg = "✅ Sin fecha límite\n\n"
         await query.edit_message_text(msg + build_tasks_footer(), parse_mode="MarkdownV2")
