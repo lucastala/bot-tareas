@@ -155,7 +155,7 @@ def sheets_delete_task_by_position(pos: int) -> str | None:
     ws = _sheets_client()
     all_rows = ws.get_all_records()
     pending = [r for r in all_rows if str(r.get("estado", "")).strip().lower() == "pendiente"]
-    pending = sorted(pending, key=lambda t: int(t.get("prioridad") or 0), reverse=False)
+    pending = sorted(pending, key=lambda t: str(t.get("fecha", "")).strip() or "9999-99-99")
     if pos < 1 or pos > len(pending):
         return None
     target = pending[pos - 1]
