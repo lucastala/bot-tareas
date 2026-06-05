@@ -133,10 +133,10 @@ async def update_task_fecha(user: dict, task_id: str, fecha: str) -> bool:
     return await loop.run_in_executor(None, _update)
 
 
-async def delete_task_by_position(user: dict, position: int) -> bool:
-    """Mark the nth pending task as completed (preserves history)."""
+async def delete_task_by_position(user: dict, position: int) -> str | None:
+    """Mark the nth pending task (in display order) as completed. Returns task name or None."""
     if not user.get("sheets_id"):
-        return False
+        return None
 
     creds = await refresh_user_credentials(user)
     loop = asyncio.get_running_loop()
@@ -150,11 +150,20 @@ async def delete_task_by_position(user: dict, position: int) -> bool:
             for idx, r in enumerate(records)
             if str(r.get("estado", "")).lower() == "pendiente"
         ]
-        if position < 1 or position > len(pending):
-            return False
-        row_idx, _ = pending[position - 1]
+        # Sort to match display order: no-date first, then dated descending
+        no_date = [(row, r) for row, r in pending if not str(r.get("fecha", "")).strip()]
+        dated = sorted(
+            [(row, r) for row, r in pending if str(r.get("fecha", "")).strip()],
+            key=lambda x: str(x[1].get("fecha", "")),
+            reverse=True,
+        )
+        sorted_pending = no_date + dated
+
+        if position < 1 or position > len(sorted_pending):
+            return None
+        row_idx, task = sorted_pending[position - 1]
         ws.update_cell(row_idx, 3, "completada")  # column 3 = estado
-        return True
+        return task.get("tarea", "")
 
     return await loop.run_in_executor(None, _delete)
 

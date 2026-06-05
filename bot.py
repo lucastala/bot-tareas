@@ -342,10 +342,10 @@ async def _route_text(
 
         if re.match(r"^\d+$", content):
             pos = int(content)
-            success = await delete_task_by_position(user, pos)
+            deleted_name = await delete_task_by_position(user, pos)
             prefix = (
-                f"✅ Tarea #{pos} eliminada.\n\n"
-                if success
+                f"✅ Eliminada: *{deleted_name}*\n\n"
+                if deleted_name is not None
                 else f"⚠️ No encontré la tarea #{pos}.\n\n"
             )
             footer = await build_tasks_footer(user)
