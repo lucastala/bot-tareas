@@ -1,8 +1,27 @@
+# Core bot
 python-telegram-bot>=21.0
 openai>=1.50.0
-gspread==6.1.2
-google-auth==2.29.0
-google-api-python-client==2.128.0
-APScheduler==3.10.4
-pytz==2024.1
-python-dotenv==1.0.1
+
+# Google APIs
+gspread>=6.1.0
+google-auth>=2.29.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+google-api-python-client>=2.128.0
+
+# Database
+supabase>=2.5.0
+
+# Scheduler
+APScheduler>=3.10.4
+
+# Web server (OAuth callback)
+fastapi>=0.111.0
+uvicorn>=0.30.0
+
+# HTTP client (used in server.py)
+httpx>=0.27.0
+
+# Utilities
+python-dotenv>=1.0.1
+pytz>=2024.1

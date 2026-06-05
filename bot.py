@@ -1,258 +1,52 @@
-import os
+import io
 import json
-import re
 import logging
-import tempfile
-import calendar as cal_module
-from datetime import datetime, timedelta, date
+import os
+import re
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
-load_dotenv()
-
-import gspread
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-
-from openai import OpenAI
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from openai import AsyncOpenAI
+from telegram import Update
 from telegram.ext import (
     Application,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import pytz
+from database import create_user, get_user
+from google_services import (
+    add_task,
+    create_event,
+    delete_task_by_position,
+    get_events_by_date,
+    get_pending_tasks,
+    get_today_events,
+    search_event,
+)
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+load_dotenv()
+
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ── Env ───────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN       = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY")
-GOOGLE_SHEETS_ID     = os.getenv("GOOGLE_SHEETS_ID")
-GOOGLE_SHEET_NAME    = os.getenv("GOOGLE_SHEET_NAME", "sebastian")
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-GOOGLE_CALENDAR_ID    = os.getenv("GOOGLE_CALENDAR_ID", "primary")
-DAILY_SUMMARY_CHAT_ID = int(os.getenv("DAILY_SUMMARY_CHAT_ID", "8589342013"))
+openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-TZ_ARG = pytz.timezone("America/Argentina/Buenos_Aires")
+PAYMENT_LINK = os.getenv("PAYMENT_LINK", "https://tu-link-de-pago.com")
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+ARGENTINA_TZ = timezone(timedelta(hours=-3))
 
-def escape_md(text: str) -> str:
-    return re.sub(r'([_*\[\]()~`>#+=|{}.!\-])', r'\\\1', str(text))
-
-DIAS_ES   = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
-MESES_ES  = ["", "ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
-
-def format_fecha_display(fecha_str: str) -> str:
-    try:
-        d = datetime.strptime(fecha_str, "%Y-%m-%d").date()
-        hoy = datetime.now(TZ_ARG).date()
-        nombre = DIAS_ES[d.weekday()]
-        if d.month == hoy.month and d.year == hoy.year:
-            return f"{nombre} {d.day}"
-        return f"{nombre} {d.day} {MESES_ES[d.month]}"
-    except Exception:
-        return fecha_str
-
-# ── Google clients ────────────────────────────────────────────────────────────
-_SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/calendar",
-]
-
-def _get_credentials():
-    creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
-    return Credentials.from_service_account_info(creds_info, scopes=_SCOPES)
-
-def _sheets_client():
-    creds = _get_credentials()
-    gc = gspread.authorize(creds)
-    return gc.open_by_key(GOOGLE_SHEETS_ID).worksheet(GOOGLE_SHEET_NAME)
-
-def _calendar_service():
-    creds = _get_credentials()
-    return build("calendar", "v3", credentials=creds, cache_discovery=False)
-
-# ── Google Sheets helpers ─────────────────────────────────────────────────────
-def sheets_get_pending() -> list[dict]:
-    ws = _sheets_client()
-    rows = ws.get_all_records()
-    return [r for r in rows if str(r.get("estado", "")).strip().lower() == "pendiente"]
-
-def sheets_add_task(text: str) -> dict:
-    ws = _sheets_client()
-    task_id = str(int(datetime.now().timestamp() * 1000))
-    ws.append_row([task_id, text.strip(), "pendiente", "", ""])
-    return {"id": task_id, "tarea": text.strip(), "estado": "pendiente"}
-
-def build_calendar_keyboard(task_id: str, year: int, month: int) -> InlineKeyboardMarkup:
-    MESES = ["", "Enero", "Feb", "Mar", "Abr", "May", "Jun",
-             "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
-    prev_m = month - 1 if month > 1 else 12
-    prev_y = year if month > 1 else year - 1
-    next_m = month + 1 if month < 12 else 1
-    next_y = year if month < 12 else year + 1
-
-    rows = []
-    rows.append([
-        InlineKeyboardButton("◀", callback_data=f"calNav_{task_id}_{prev_y}_{prev_m:02d}"),
-        InlineKeyboardButton(f"{MESES[month]} {year}", callback_data="calIgnore"),
-        InlineKeyboardButton("▶", callback_data=f"calNav_{task_id}_{next_y}_{next_m:02d}"),
-    ])
-    rows.append([InlineKeyboardButton(d, callback_data="calIgnore")
-                 for d in ["Lu", "Ma", "Mi", "Ju", "Vi", "Sa", "Do"]])
-    now = datetime.now(TZ_ARG)
-    for week in cal_module.monthcalendar(year, month):
-        row = []
-        for day in week:
-            if day == 0:
-                row.append(InlineKeyboardButton(" ", callback_data="calIgnore"))
-            else:
-                is_today = (day == now.day and month == now.month and year == now.year)
-                label = f"[{day}]" if is_today else str(day)
-                row.append(InlineKeyboardButton(
-                    label, callback_data=f"calDay_{task_id}_{year}-{month:02d}-{day:02d}"
-                ))
-        rows.append(row)
-    rows.append([InlineKeyboardButton("Sin fecha", callback_data=f"calDay_{task_id}_ninguna")])
-    return InlineKeyboardMarkup(rows)
-
-def sheets_update_fecha(task_id: str, fecha: str) -> bool:
-    ws = _sheets_client()
-    all_rows = ws.get_all_records()
-    all_ids = [str(r.get("id", "")) for r in all_rows]
-    if task_id not in all_ids:
-        return False
-    sheet_row = all_ids.index(task_id) + 2
-    headers = ws.row_values(1)
-    fecha_col = headers.index("fecha") + 1
-    ws.update_cell(sheet_row, fecha_col, fecha)
-    return True
-
-def sheets_update_priority(task_id: str, stars: int) -> bool:
-    ws = _sheets_client()
-    all_rows = ws.get_all_records()
-    all_ids = [str(r.get("id", "")) for r in all_rows]
-    if task_id not in all_ids:
-        return False
-    sheet_row = all_ids.index(task_id) + 2
-    headers = ws.row_values(1)
-    col_name = "prioridad" if "prioridad" in headers else "fecha"
-    prio_col = headers.index(col_name) + 1
-    ws.update_cell(sheet_row, prio_col, stars)
-    return True
-
-def sheets_delete_task_by_position(pos: int) -> str | None:
-    """pos is 1-based. Returns deleted task name or None if not found."""
-    ws = _sheets_client()
-    all_rows = ws.get_all_records()
-    pending = [r for r in all_rows if str(r.get("estado", "")).strip().lower() == "pendiente"]
-    pending = _sort_tasks(pending)
-    if pos < 1 or pos > len(pending):
-        return None
-    target = pending[pos - 1]
-    task_id = str(target["id"])
-    # Find actual row index in sheet (1-based, +1 for header)
-    all_ids = [str(r.get("id", "")) for r in all_rows]
-    sheet_row = all_ids.index(task_id) + 2  # +2: header + 1-based
-    estado_col = ws.row_values(1).index("estado") + 1
-    ws.update_cell(sheet_row, estado_col, "completada")
-    return target["tarea"]
-
-# ── Google Calendar helpers ───────────────────────────────────────────────────
-def _today_str() -> str:
-    return datetime.now(TZ_ARG).strftime("%Y-%m-%d")
-
-def _day_bounds(date_str: str):
-    """Returns (start_rfc, end_rfc) for a full day in Argentina timezone."""
-    day = TZ_ARG.localize(datetime.strptime(date_str, "%Y-%m-%d"))
-    start = day.isoformat()
-    end = (day + timedelta(days=1)).isoformat()
-    return start, end
-
-def cal_get_events_by_date(date_str: str) -> list[dict]:
-    svc = _calendar_service()
-    start, end = _day_bounds(date_str)
-    result = svc.events().list(
-        calendarId=GOOGLE_CALENDAR_ID,
-        timeMin=start,
-        timeMax=end,
-        singleEvents=True,
-        orderBy="startTime",
-    ).execute()
-    events = []
-    for e in result.get("items", []):
-        s = e["start"]
-        hora = s.get("dateTime", s.get("date", ""))
-        if "T" in hora:
-            hora = datetime.fromisoformat(hora).astimezone(TZ_ARG).strftime("%H:%M")
-        else:
-            hora = "todo el día"
-        events.append({"nombre": e.get("summary", ""), "hora": hora, "id": e["id"]})
-    return events
-
-def cal_get_today_events() -> list[dict]:
-    return cal_get_events_by_date(_today_str())
-
-def cal_search_event(query: str) -> list[dict]:
-    svc = _calendar_service()
-    now = datetime.now(TZ_ARG).isoformat()
-    result = svc.events().list(
-        calendarId=GOOGLE_CALENDAR_ID,
-        q=query,
-        timeMin=now,
-        singleEvents=True,
-        orderBy="startTime",
-        maxResults=5,
-    ).execute()
-    events = []
-    for e in result.get("items", []):
-        s = e["start"]
-        hora = s.get("dateTime", s.get("date", ""))
-        if "T" in hora:
-            hora = datetime.fromisoformat(hora).astimezone(TZ_ARG).strftime("%d/%m/%Y %H:%M")
-        else:
-            hora = datetime.strptime(hora, "%Y-%m-%d").strftime("%d/%m/%Y") + " (todo el día)"
-        events.append({"nombre": e.get("summary", ""), "hora": hora, "id": e["id"]})
-    return events
-
-def cal_create_event(nombre: str, fecha: str, hora: str | None = None) -> dict:
-    svc = _calendar_service()
-    if hora:
-        dt_str = f"{fecha}T{hora}:00"
-        dt_start = TZ_ARG.localize(datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S"))
-        dt_end = dt_start + timedelta(hours=1)
-        event_body = {
-            "summary": nombre,
-            "start": {"dateTime": dt_start.isoformat(), "timeZone": "America/Argentina/Buenos_Aires"},
-            "end":   {"dateTime": dt_end.isoformat(),   "timeZone": "America/Argentina/Buenos_Aires"},
-        }
-    else:
-        event_body = {
-            "summary": nombre,
-            "start": {"date": fecha},
-            "end":   {"date": fecha},
-        }
-    created = svc.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event_body).execute()
-    return {"nombre": nombre, "fecha": fecha, "hora": hora or "todo el día", "id": created["id"]}
-
-# ── OpenAI function calling ───────────────────────────────────────────────────
-oai = OpenAI(api_key=OPENAI_API_KEY)
-
-TOOLS = [
+OPENAI_TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "get_today_events",
-            "description": "Obtiene los eventos de hoy en Google Calendar.",
+            "description": "Obtiene los eventos de hoy del Google Calendar del usuario",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
@@ -260,11 +54,14 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_events_by_date",
-            "description": "Obtiene los eventos de una fecha específica.",
+            "description": "Obtiene los eventos de una fecha específica del Google Calendar",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "fecha": {"type": "string", "description": "Fecha en formato YYYY-MM-DD"}
+                    "fecha": {
+                        "type": "string",
+                        "description": "Fecha en formato YYYY-MM-DD",
+                    }
                 },
                 "required": ["fecha"],
             },
@@ -274,11 +71,14 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_event",
-            "description": "Busca eventos en Google Calendar por nombre o descripción.",
+            "description": "Busca un evento por nombre o descripción en Google Calendar",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Texto a buscar"}
+                    "query": {
+                        "type": "string",
+                        "description": "Término de búsqueda del evento",
+                    }
                 },
                 "required": ["query"],
             },
@@ -288,13 +88,22 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "create_event",
-            "description": "Crea un evento en Google Calendar.",
+            "description": "Crea un nuevo evento en Google Calendar",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "nombre": {"type": "string", "description": "Nombre del evento"},
-                    "fecha":  {"type": "string", "description": "Fecha en formato YYYY-MM-DD"},
-                    "hora":   {"type": "string", "description": "Hora en formato HH:MM, o null si es todo el día"},
+                    "nombre": {"type": "string", "description": "Título del evento"},
+                    "fecha": {
+                        "type": "string",
+                        "description": "Fecha en formato YYYY-MM-DD",
+                    },
+                    "hora": {
+                        "type": "string",
+                        "description": (
+                            "Hora en formato HH:MM (opcional). "
+                            "Si no se provee se crea como evento de todo el día."
+                        ),
+                    },
                 },
                 "required": ["nombre", "fecha"],
             },
@@ -304,260 +113,269 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_pending_tasks",
-            "description": "Lee las tareas pendientes de Google Sheets.",
+            "description": "Obtiene las tareas pendientes del usuario desde Google Sheets",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
 ]
 
-def _dispatch_tool(name: str, args: dict) -> str:
-    if name == "get_today_events":
-        events = cal_get_today_events()
-        if not events:
-            return "No hay eventos hoy."
-        return "\n".join(f"- {e['hora']} {e['nombre']}" for e in events)
 
-    if name == "get_events_by_date":
-        events = cal_get_events_by_date(args["fecha"])
-        if not events:
-            return f"No hay eventos el {args['fecha']}."
-        return "\n".join(f"- {e['hora']} {e['nombre']}" for e in events)
+async def build_tasks_footer(user: dict) -> str:
+    try:
+        tasks = await get_pending_tasks(user)
+    except Exception as e:
+        logger.error(f"Error fetching tasks for user {user.get('chat_id')}: {e}")
+        return "⚠️ No se pudieron cargar las tareas pendientes."
 
-    if name == "search_event":
-        events = cal_search_event(args["query"])
-        if not events:
-            return "No encontré eventos con ese nombre."
-        return "\n".join(f"- {e['hora']} {e['nombre']}" for e in events)
+    if not tasks:
+        return "No tenés tareas pendientes.\n\nUsá .texto para agregar tarea."
 
-    if name == "create_event":
-        ev = cal_create_event(args["nombre"], args["fecha"], args.get("hora"))
-        hora_txt = ev["hora"] if ev["hora"] != "todo el día" else "todo el día"
-        return f"Evento creado: {ev['nombre']} el {ev['fecha']} a las {hora_txt}."
+    lines = ["📋 Tareas pendientes:"]
+    for i, task in enumerate(tasks, 1):
+        lines.append(f"{i}. {task['tarea']}")
+    lines.append("\nUsá .texto para agregar tarea. Usá .número para eliminar.")
+    return "\n".join(lines)
 
-    if name == "get_pending_tasks":
-        tasks = sheets_get_pending()
-        if not tasks:
-            return "No tenés tareas pendientes."
-        return "\n".join(f"{i+1}. {t['tarea']}" for i, t in enumerate(tasks))
 
-    return "Herramienta desconocida."
+async def _execute_tool(func_name: str, func_args: dict, user: dict):
+    if func_name == "get_today_events":
+        return await get_today_events(user)
+    if func_name == "get_events_by_date":
+        return await get_events_by_date(user, func_args["fecha"])
+    if func_name == "search_event":
+        return await search_event(user, func_args["query"])
+    if func_name == "create_event":
+        return await create_event(
+            user, func_args["nombre"], func_args["fecha"], func_args.get("hora")
+        )
+    if func_name == "get_pending_tasks":
+        return await get_pending_tasks(user)
+    return {"error": f"Función desconocida: {func_name}"}
 
-def openai_process(user_text: str) -> str:
-    today = datetime.now(TZ_ARG).strftime("%Y-%m-%d")
+
+async def _call_openai(user: dict, text: str) -> str:
+    today = datetime.now(ARGENTINA_TZ).strftime("%Y-%m-%d")
     messages = [
         {
             "role": "system",
             "content": (
-                f"Sos un asistente personal. Hoy es {today} (zona horaria America/Argentina/Buenos_Aires). "
-                "Usá las herramientas disponibles para responder. Respondé siempre en español, de forma concisa. "
-                "Cuando creés un evento y el usuario dice una hora en punto ('a las 4', 'a las 10'), "
-                "usá siempre :00 como minutos (ej: 16:00, 10:00). Nunca uses los minutos actuales del reloj."
+                "Sos un asistente personal de productividad. "
+                "Ayudás a gestionar tareas y eventos de Google Calendar. "
+                "Respondé en español rioplatense, de forma concisa y amigable. "
+                f"La fecha de hoy es {today}. "
+                "Si el usuario menciona días relativos (mañana, el lunes, etc.), "
+                "calculá la fecha correcta a partir de hoy. "
+                "Cuando el usuario pide una hora en punto ('a las 4', 'a las 10'), "
+                "usá siempre HH:00 como minutos."
             ),
         },
-        {"role": "user", "content": user_text},
+        {"role": "user", "content": text},
     ]
 
-    while True:
-        response = oai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-        )
-        msg = response.choices[0].message
+    response = await openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        tools=OPENAI_TOOLS,
+        tool_choice="auto",
+    )
 
-        if not msg.tool_calls:
-            return msg.content or ""
+    msg = response.choices[0].message
 
-        messages.append(msg)
-        for tc in msg.tool_calls:
-            args = json.loads(tc.function.arguments)
-            result = _dispatch_tool(tc.function.name, args)
-            messages.append({
-                "role": "tool",
+    if not msg.tool_calls:
+        return msg.content or "No pude procesar tu mensaje."
+
+    messages.append(msg)
+
+    for tc in msg.tool_calls:
+        func_name = tc.function.name
+        func_args = json.loads(tc.function.arguments)
+        logger.info(f"Tool call: {func_name}({func_args}) for user {user['chat_id']}")
+        result = await _execute_tool(func_name, func_args, user)
+        messages.append(
+            {
                 "tool_call_id": tc.id,
-                "content": result,
-            })
-
-# ── Transcribe audio ──────────────────────────────────────────────────────────
-def transcribe_audio(file_path: str) -> str:
-    with open(file_path, "rb") as f:
-        transcript = oai.audio.transcriptions.create(
-            model="whisper-1",
-            file=f,
-            language="es",
+                "role": "tool",
+                "name": func_name,
+                "content": json.dumps(result, ensure_ascii=False, default=str),
+            }
         )
-    return transcript.text
 
-# ── Pending tasks footer ───────────────────────────────────────────────────────
-def _sort_tasks(tasks: list) -> list:
-    no_date = [t for t in tasks if not str(t.get("fecha", "")).strip()]
-    dated   = sorted([t for t in tasks if str(t.get("fecha", "")).strip()],
-                     key=lambda t: str(t.get("fecha", "")), reverse=True)
-    return no_date + dated
-
-def build_tasks_footer() -> str:
-    tasks = sheets_get_pending()
-    if not tasks:
-        lines = ["📋 *Tareas pendientes:*", "_No hay tareas pendientes\\._"]
-    else:
-        lines = ["📋 *Tareas pendientes:*"]
-        for i, t in enumerate(_sort_tasks(tasks), 1):
-            fecha = str(t.get("fecha", "")).strip()
-            if fecha:
-                lines.append(f"{i}\\. *{escape_md(format_fecha_display(fecha))}* — {escape_md(t['tarea'])}")
-            else:
-                lines.append(f"{i}\\. {escape_md(t['tarea'])}")
-    lines.append("")
-    lines.append("_Usá \\.texto para agregar tarea\\. Usá \\.número para eliminar\\._")
-    return "\n".join(lines)
-
-# ── Core message logic ────────────────────────────────────────────────────────
-async def process_text(text: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = text.strip()
-
-    # .hoy / .mañana → eventos de calendar
-    if text.lower() in (".hoy", ".manana", ".mañana"):
-        fecha = _today_str() if text.lower() == ".hoy" else (datetime.now(TZ_ARG) + timedelta(days=1)).strftime("%Y-%m-%d")
-        events = cal_get_events_by_date(fecha)
-        label = "hoy" if text.lower() == ".hoy" else "mañana"
-        if events:
-            lines = [f"📅 *Eventos de {label}:*"]
-            for e in events:
-                lines.append(f"\\- {escape_md(e['hora'])} {escape_md(e['nombre'])}")
-        else:
-            lines = [f"📅 No hay eventos {label}\\."]
-        await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
-        return
-
-    # .lista → tareas pendientes
-    if text.lower() == ".lista":
-        await update.message.reply_text(build_tasks_footer(), parse_mode="MarkdownV2")
-        return
-
-    # .número → eliminar tarea
-    m = re.match(r"^\.(\d+)$", text)
-    if m:
-        pos = int(m.group(1))
-        deleted = sheets_delete_task_by_position(pos)
-        if deleted:
-            reply = f"✅ Tarea *{pos}* eliminada: _{escape_md(deleted)}_\n\n"
-        else:
-            reply = f"⚠️ No existe la tarea número {pos}\\.\n\n"
-        await update.message.reply_text(
-            reply + build_tasks_footer(), parse_mode="MarkdownV2"
-        )
-        return
-
-    # .texto → agregar tarea
-    m = re.match(r"^\.\s*(.+)$", text)
-    if m:
-        task_text = m.group(1).strip()
-        task = sheets_add_task(task_text)
-        now = datetime.now(TZ_ARG)
-        keyboard = build_calendar_keyboard(task["id"], now.year, now.month)
-        await update.message.reply_text(
-            f"✅ Tarea agregada: _{escape_md(task_text)}_\n\n¿Fecha límite?",
-            parse_mode="MarkdownV2",
-            reply_markup=keyboard,
-        )
-        return
-
-    # Cualquier otro texto → OpenAI function calling
-    ai_reply = openai_process(text)
-    await update.message.reply_text(
-        escape_md(ai_reply) + "\n\n" + build_tasks_footer(), parse_mode="MarkdownV2"
+    final = await openai_client.chat.completions.create(
+        model="gpt-4o-mini", messages=messages
     )
+    return final.choices[0].message.content or "Listo."
 
-# ── Telegram handlers ─────────────────────────────────────────────────────────
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await process_text(update.message.text, update, context)
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    voice = update.message.voice
-    tg_file = await context.bot.get_file(voice.file_id)
-    tmp_path = os.path.join(tempfile.gettempdir(), f"voice_{voice.file_id}.ogg")
-    await tg_file.download_to_drive(tmp_path)
-    try:
-        transcribed = transcribe_audio(tmp_path)
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-    await update.message.reply_text(f"🎙 _Transcripción:_ {escape_md(transcribed)}", parse_mode="MarkdownV2")
-    await process_text(transcribed, update, context)
-
-# ── Calendar callbacks ────────────────────────────────────────────────────────
-async def handle_cal_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "calIgnore":
-        return
-    parts = query.data.split("_", 3)
-    task_id, year, month = parts[1], int(parts[2]), int(parts[3])
-    await query.edit_message_reply_markup(
-        reply_markup=build_calendar_keyboard(task_id, year, month)
+async def _transcribe_voice(voice_bytes: bytes) -> str:
+    buf = io.BytesIO(voice_bytes)
+    buf.name = "audio.ogg"
+    result = await openai_client.audio.transcriptions.create(
+        model="whisper-1", file=buf, language="es"
     )
+    return result.text
 
-async def handle_cal_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    try:
-        parts = query.data.split("_", 2)
-        task_id, fecha_val = parts[1], parts[2]
-        if fecha_val != "ninguna":
-            sheets_update_fecha(task_id, fecha_val)
-            msg = f"✅ Fecha límite: {escape_md(format_fecha_display(fecha_val))}\n\n"
+
+async def _route_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user: dict, text: str
+) -> None:
+    message = update.message
+
+    # Dot commands ───────────────────────────────────────────────────────────
+    if text.startswith("."):
+        content = text[1:].strip()
+
+        if re.match(r"^\d+$", content):
+            pos = int(content)
+            success = await delete_task_by_position(user, pos)
+            prefix = (
+                f"✅ Tarea #{pos} eliminada.\n\n"
+                if success
+                else f"⚠️ No encontré la tarea #{pos}.\n\n"
+            )
+        elif content:
+            await add_task(user, content)
+            prefix = f"✅ Tarea agregada: {content}\n\n"
         else:
-            msg = "✅ Sin fecha límite\n\n"
-        await query.edit_message_text(msg + build_tasks_footer(), parse_mode="MarkdownV2")
+            prefix = "⚠️ Usá .texto para agregar o .número para eliminar.\n\n"
+
+        footer = await build_tasks_footer(user)
+        await message.reply_text(prefix + footer)
+        return
+
+    # OpenAI function calling ────────────────────────────────────────────────
+    try:
+        reply = await _call_openai(user, text)
     except Exception as e:
-        logger.error(f"Error en cal_day callback: {e}")
-        await query.edit_message_text(f"❌ Error: {e}")
+        logger.error(f"OpenAI error for user {user['chat_id']}: {e}")
+        reply = "⚠️ Tuve un error procesando tu mensaje. Intentá de nuevo."
 
-# ── Daily summary ─────────────────────────────────────────────────────────────
-async def send_daily_summary(bot):
-    events = cal_get_today_events()
-    tasks  = sheets_get_pending()
+    footer = await build_tasks_footer(user)
+    await message.reply_text(reply + "\n\n" + footer)
 
-    if events:
-        ev_lines = ["📅 *Eventos de hoy:*"]
-        for e in events:
-            ev_lines.append(f"\\- {escape_md(e['hora'])} {escape_md(e['nombre'])}")
-        events_block = "\n".join(ev_lines)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message:
+        return
+
+    chat_id = update.effective_chat.id
+    user = await get_user(chat_id)
+
+    # New user — start onboarding
+    if user is None:
+        await _start_onboarding(update)
+        return
+
+    # OAuth not completed yet
+    if not user.get("access_token"):
+        oauth_url = f"{BASE_URL}/oauth/start?chat_id={chat_id}"
+        await message.reply_text(
+            f"⚠️ Todavía no conectaste tu cuenta de Google.\n\n"
+            f"Completá la configuración aquí:\n{oauth_url}"
+        )
+        return
+
+    # Subscription check
+    if user.get("estado_suscripcion") not in ("activo", "trial"):
+        await message.reply_text(
+            f"⚠️ Tu suscripción no está activa.\n\nActivá tu plan aquí:\n{PAYMENT_LINK}"
+        )
+        return
+
+    await message.reply_chat_action("typing")
+
+    # Voice → transcribe → re-route
+    if message.voice:
+        try:
+            voice_file = await message.voice.get_file()
+            raw = await voice_file.download_as_bytearray()
+            text = await _transcribe_voice(bytes(raw))
+            await message.reply_text(f"🗣️ Transcripción: {text}")
+        except Exception as e:
+            logger.error(f"Voice transcription error for user {chat_id}: {e}")
+            await message.reply_text(
+                "⚠️ No pude transcribir el audio. Intentá de nuevo."
+            )
+            return
     else:
-        events_block = "📅 *Eventos de hoy:* _ninguno_"
+        text = message.text or ""
 
-    if tasks:
-        t_lines = ["📋 *Tareas pendientes:*"]
-        for i, t in enumerate(tasks, 1):
-            t_lines.append(f"{i}\\. {escape_md(t['tarea'])}")
-        tasks_block = "\n".join(t_lines)
+    if not text.strip():
+        return
+
+    await _route_text(update, context, user, text)
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    user = await get_user(chat_id)
+
+    if user and user.get("access_token"):
+        await update.message.reply_text(
+            "👋 ¡Hola! Ya estás configurado y listo.\n\n"
+            "Podés decirme:\n"
+            "• .texto → agregar tarea\n"
+            "• .número → eliminar tarea por número\n"
+            "• 'qué tengo hoy' → ver eventos del día\n"
+            "• 'crear reunión el viernes a las 10' → agregar evento\n"
+            "• Audio de voz 🎤 → lo transcribo y proceso"
+        )
     else:
-        tasks_block = "📋 *Tareas pendientes:* _ninguna_"
+        await _start_onboarding(update)
 
-    msg = f"☀️ *Buenos días\\!* Acá tu resumen de hoy:\n\n{events_block}\n\n{tasks_block}"
-    await bot.send_message(chat_id=DAILY_SUMMARY_CHAT_ID, text=msg, parse_mode="MarkdownV2")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+async def _start_onboarding(update: Update) -> None:
+    chat_id = update.effective_chat.id
+    nombre = update.effective_user.first_name or "Usuario"
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    app.add_handler(CallbackQueryHandler(handle_cal_nav, pattern=r"^calNav_|^calIgnore$"))
-    app.add_handler(CallbackQueryHandler(handle_cal_day, pattern=r"^calDay_"))
+    if not await get_user(chat_id):
+        await create_user(chat_id, nombre)
 
-    scheduler = AsyncIOScheduler(timezone=TZ_ARG)
-    scheduler.add_job(
-        lambda: app.create_task(send_daily_summary(app.bot)),
-        trigger="cron",
-        hour=8,
-        minute=0,
+    oauth_url = f"{BASE_URL}/oauth/start?chat_id={chat_id}"
+    await update.message.reply_text(
+        f"👋 ¡Hola {nombre}! Bienvenido a tu asistente personal.\n\n"
+        f"Para empezar, necesito conectar tu cuenta de Google. "
+        f"Esto me da acceso a tu Calendar y crea tu hoja de tareas en Google Sheets.\n\n"
+        f"👉 Hacé clic aquí para autorizar:\n{oauth_url}\n\n"
+        f"Una vez que completes la autorización, ¡ya podés usar el bot!"
     )
-    scheduler.start()
 
-    logger.info("Bot iniciado.")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+async def _post_init(application: Application) -> None:
+    from scheduler import setup_scheduler
+
+    scheduler = setup_scheduler(application.bot)
+    scheduler.start()
+    application.bot_data["scheduler"] = scheduler
+    logger.info("Scheduler started — daily summary at 08:00 Argentina time")
+
+
+async def _post_shutdown(application: Application) -> None:
+    scheduler = application.bot_data.get("scheduler")
+    if scheduler and scheduler.running:
+        scheduler.shutdown()
+        logger.info("Scheduler stopped")
+
+
+def main() -> None:
+    token = os.getenv("TELEGRAM_TOKEN")
+    if not token:
+        raise ValueError("TELEGRAM_TOKEN not set in .env")
+
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(MessageHandler(filters.TEXT | filters.VOICE, handle_message))
+
+    logger.info("Bot starting — polling for updates")
+    app.run_polling(allowed_updates=["message"])
+
 
 if __name__ == "__main__":
     main()
