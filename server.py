@@ -1,6 +1,9 @@
 import asyncio
+import base64
+import hashlib
 import logging
 import os
+import secrets
 
 import httpx
 from dotenv import load_dotenv
@@ -81,15 +84,31 @@ def _build_flow() -> Flow:
     )
 
 
+def _make_code_verifier() -> str:
+    return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+
+
+def _make_code_challenge(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode()).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
 @app.get("/oauth/start")
 async def oauth_start(chat_id: int):
+    code_verifier = _make_code_verifier()
+    code_challenge = _make_code_challenge(code_verifier)
+
     flow = _build_flow()
-    # chat_id va directo en state — sobrevive reinicios del servidor
+    # Encode chat_id + code_verifier in state — survives server restarts
+    state = f"{chat_id}:{code_verifier}"
+
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
-        state=str(chat_id),
+        state=state,
         prompt="consent",
+        code_challenge=code_challenge,
+        code_challenge_method="S256",
     )
     return RedirectResponse(auth_url)
 
@@ -97,7 +116,7 @@ async def oauth_start(chat_id: int):
 @app.get("/oauth/callback")
 async def oauth_callback(request: Request):
     code = request.query_params.get("code")
-    state = request.query_params.get("state")  # es el chat_id
+    state = request.query_params.get("state")
 
     if not code or not state:
         return HTMLResponse(
@@ -105,22 +124,27 @@ async def oauth_callback(request: Request):
             status_code=400,
         )
 
+    # Decode chat_id and code_verifier from state
     try:
-        chat_id = int(state)
-    except ValueError:
+        chat_id_str, code_verifier = state.split(":", 1)
+        chat_id = int(chat_id_str)
+    except (ValueError, AttributeError):
         return HTMLResponse(
-            _ERROR_HTML.format(message="Estado inválido."), status_code=400
+            _ERROR_HTML.format(message="Estado inválido. Pedí el link de nuevo."),
+            status_code=400,
         )
 
-    # Reconstruimos el flow — es determinístico, no necesita estado en memoria
     loop = asyncio.get_running_loop()
     try:
         flow = _build_flow()
-        await loop.run_in_executor(None, lambda: flow.fetch_token(code=code))
+        await loop.run_in_executor(
+            None,
+            lambda: flow.fetch_token(code=code, code_verifier=code_verifier),
+        )
     except Exception as e:
         logger.error(f"Token exchange failed for chat_id={chat_id}: {e}")
         return HTMLResponse(
-            _ERROR_HTML.format(message="No se pudo completar la autorización. Intentá de nuevo."),
+            _ERROR_HTML.format(message="No se pudo completar la autorización. Pedí el link de nuevo."),
             status_code=500,
         )
 
