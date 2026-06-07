@@ -28,6 +28,8 @@ from google_services import (
     get_pending_tasks,
     get_today_events,
     search_event,
+    update_event,
+    update_task,
     update_task_fecha,
 )
 
@@ -48,6 +50,22 @@ ARGENTINA_TZ = timezone(timedelta(hours=-3))
 DIAS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
 MESES_ES = ["", "ene", "feb", "mar", "abr", "may", "jun",
             "jul", "ago", "sep", "oct", "nov", "dic"]
+
+# Conversation memory — last N exchanges per user (in-memory, resets on restart)
+_conversation_history: dict[int, list[dict]] = {}
+MAX_HISTORY_EXCHANGES = 8  # 8 user+assistant pairs = 16 messages
+
+
+def _get_history(chat_id: int) -> list[dict]:
+    return list(_conversation_history.get(chat_id, []))
+
+
+def _add_to_history(chat_id: int, user_msg: str, assistant_msg: str) -> None:
+    history = _conversation_history.setdefault(chat_id, [])
+    history.append({"role": "user", "content": user_msg})
+    history.append({"role": "assistant", "content": assistant_msg})
+    if len(history) > MAX_HISTORY_EXCHANGES * 2:
+        _conversation_history[chat_id] = history[-(MAX_HISTORY_EXCHANGES * 2):]
 
 OPENAI_TOOLS = [
     {
@@ -150,6 +168,68 @@ OPENAI_TOOLS = [
                     },
                 },
                 "required": ["event_id", "event_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_event",
+            "description": (
+                "Edita un evento existente del Google Calendar. "
+                "Primero buscá el evento con search_event o get_events_by_date para obtener su ID. "
+                "Podés cambiar el nombre, la fecha y/o la hora."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "event_id": {
+                        "type": "string",
+                        "description": "ID del evento a editar",
+                    },
+                    "nuevo_nombre": {
+                        "type": "string",
+                        "description": "Nuevo nombre/título del evento (opcional)",
+                    },
+                    "nueva_fecha": {
+                        "type": "string",
+                        "description": "Nueva fecha en formato YYYY-MM-DD (opcional)",
+                    },
+                    "nueva_hora": {
+                        "type": "string",
+                        "description": "Nueva hora en formato HH:MM (opcional)",
+                    },
+                },
+                "required": ["event_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_task",
+            "description": (
+                "Edita una tarea pendiente por su número de posición en la lista. "
+                "Podés cambiar el nombre y/o la fecha. "
+                "Usá get_pending_tasks primero si necesitás saber el número de la tarea."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "posicion": {
+                        "type": "integer",
+                        "description": "Número de posición de la tarea en la lista (empieza en 1)",
+                    },
+                    "nuevo_nombre": {
+                        "type": "string",
+                        "description": "Nuevo nombre de la tarea (opcional)",
+                    },
+                    "nueva_fecha": {
+                        "type": "string",
+                        "description": "Nueva fecha en formato YYYY-MM-DD, o cadena vacía para quitar la fecha (opcional)",
+                    },
+                },
+                "required": ["posicion"],
             },
         },
     },
@@ -260,6 +340,23 @@ async def _execute_tool(func_name: str, func_args: dict, user: dict):
         )
     if func_name == "get_pending_tasks":
         return await get_pending_tasks(user)
+    if func_name == "update_event":
+        result = await update_event(
+            user,
+            func_args["event_id"],
+            nuevo_nombre=func_args.get("nuevo_nombre"),
+            nueva_fecha=func_args.get("nueva_fecha"),
+            nueva_hora=func_args.get("nueva_hora"),
+        )
+        return result
+    if func_name == "update_task":
+        ok = await update_task(
+            user,
+            func_args["posicion"],
+            nuevo_nombre=func_args.get("nuevo_nombre"),
+            nueva_fecha=func_args.get("nueva_fecha"),
+        )
+        return {"ok": ok}
     return {"error": f"Función desconocida: {func_name}"}
 
 
@@ -267,25 +364,31 @@ async def _call_openai(
     user: dict, text: str
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     today = datetime.now(ARGENTINA_TZ).strftime("%Y-%m-%d")
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Sos un asistente personal de productividad. "
-                "Ayudás a gestionar tareas y eventos de Google Calendar. "
-                "Respondé en español rioplatense, de forma concisa y amigable. "
-                f"La fecha de hoy es {today}. "
-                "Si el usuario menciona días relativos (mañana, el lunes, etc.), "
-                "calculá la fecha correcta a partir de hoy. "
-                "Cuando el usuario pide una hora en punto ('a las 4', 'a las 10'), "
-                "usá siempre HH:00 como minutos. "
-                "Cuando el usuario quiera eliminar un evento, primero buscalo con "
-                "search_event o get_events_by_date para obtener su ID, y luego "
-                "usá propose_delete_event para mostrarle la confirmación."
-            ),
-        },
-        {"role": "user", "content": text},
-    ]
+    chat_id = user["chat_id"]
+
+    system_msg = {
+        "role": "system",
+        "content": (
+            "Sos un asistente personal de productividad. "
+            "Ayudás a gestionar tareas y eventos de Google Calendar. "
+            "Respondé en español rioplatense, de forma concisa y amigable. "
+            f"La fecha de hoy es {today}. "
+            "Si el usuario menciona días relativos (mañana, el lunes, etc.), "
+            "calculá la fecha correcta a partir de hoy. "
+            "Cuando el usuario pide una hora en punto ('a las 4', 'a las 10'), "
+            "usá siempre HH:00 como minutos. "
+            "Cuando el usuario quiera eliminar un evento, primero buscalo con "
+            "search_event o get_events_by_date para obtener su ID, y luego "
+            "usá propose_delete_event para mostrarle la confirmación. "
+            "Cuando el usuario quiera editar un evento (cambiar hora, nombre, fecha), "
+            "primero buscalo para obtener su ID y luego usá update_event. "
+            "Cuando el usuario quiera editar una tarea (renombrar, cambiar fecha), "
+            "usá update_task con su número de posición."
+        ),
+    }
+
+    # Build messages: system + history + current
+    messages = [system_msg] + _get_history(chat_id) + [{"role": "user", "content": text}]
 
     response = await openai_client.chat.completions.create(
         model="gpt-4o-mini",
@@ -297,7 +400,9 @@ async def _call_openai(
     msg = response.choices[0].message
 
     if not msg.tool_calls:
-        return msg.content or "No pude procesar tu mensaje.", None
+        reply = msg.content or "No pude procesar tu mensaje."
+        _add_to_history(chat_id, text, reply)
+        return reply, None
 
     messages.append(msg)
     pending_keyboard: InlineKeyboardMarkup | None = None
@@ -305,7 +410,7 @@ async def _call_openai(
     for tc in msg.tool_calls:
         func_name = tc.function.name
         func_args = json.loads(tc.function.arguments)
-        logger.info(f"Tool call: {func_name}({func_args}) for user {user['chat_id']}")
+        logger.info(f"Tool call: {func_name}({func_args}) for user {chat_id}")
 
         if func_name == "propose_delete_event":
             event_id = func_args["event_id"]
@@ -336,7 +441,9 @@ async def _call_openai(
     final = await openai_client.chat.completions.create(
         model="gpt-4o-mini", messages=messages
     )
-    return final.choices[0].message.content or "Listo.", pending_keyboard
+    reply = final.choices[0].message.content or "Listo."
+    _add_to_history(chat_id, text, reply)
+    return reply, pending_keyboard
 
 
 async def _transcribe_voice(voice_bytes: bytes) -> str:

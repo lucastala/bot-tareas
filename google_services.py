@@ -209,6 +209,7 @@ async def _get_calendar_events(
             start_val = ev["start"].get("dateTime", ev["start"].get("date", ""))
             events.append(
                 {
+                    "id": ev.get("id", ""),
                     "nombre": ev.get("summary", "Sin título"),
                     "inicio": start_val,
                     "descripcion": ev.get("description", ""),
@@ -241,6 +242,7 @@ async def search_event(user: dict, query: str) -> list[dict]:
             start_val = ev["start"].get("dateTime", ev["start"].get("date", ""))
             events.append(
                 {
+                    "id": ev.get("id", ""),
                     "nombre": ev.get("summary", "Sin título"),
                     "inicio": start_val,
                     "descripcion": ev.get("description", ""),
@@ -249,6 +251,96 @@ async def search_event(user: dict, query: str) -> list[dict]:
         return events
 
     return await loop.run_in_executor(None, _search)
+
+
+async def update_event(
+    user: dict,
+    event_id: str,
+    nuevo_nombre: str | None = None,
+    nueva_fecha: str | None = None,
+    nueva_hora: str | None = None,
+) -> dict:
+    creds = await refresh_user_credentials(user)
+    loop = asyncio.get_running_loop()
+
+    def _update():
+        service = build("calendar", "v3", credentials=creds)
+        event = service.events().get(calendarId="primary", eventId=event_id).execute()
+
+        if nuevo_nombre:
+            event["summary"] = nuevo_nombre
+
+        if nueva_fecha or nueva_hora:
+            if "dateTime" in event.get("start", {}):
+                start_dt = datetime.fromisoformat(event["start"]["dateTime"])
+                end_dt = datetime.fromisoformat(event["end"]["dateTime"])
+                duration = end_dt - start_dt
+
+                if nueva_fecha:
+                    d = datetime.strptime(nueva_fecha, "%Y-%m-%d")
+                    start_dt = start_dt.replace(year=d.year, month=d.month, day=d.day)
+                if nueva_hora:
+                    h, m = map(int, nueva_hora.split(":"))
+                    start_dt = start_dt.replace(hour=h, minute=m, second=0)
+
+                new_end = start_dt + duration
+                tz = "America/Argentina/Buenos_Aires"
+                event["start"] = {"dateTime": start_dt.strftime("%Y-%m-%dT%H:%M:00"), "timeZone": tz}
+                event["end"] = {"dateTime": new_end.strftime("%Y-%m-%dT%H:%M:00"), "timeZone": tz}
+            else:
+                if nueva_fecha:
+                    event["start"] = {"date": nueva_fecha}
+                    event["end"] = {"date": nueva_fecha}
+
+        updated = service.events().update(
+            calendarId="primary", eventId=event_id, body=event
+        ).execute()
+        return {"nombre": updated.get("summary"), "id": updated.get("id")}
+
+    return await loop.run_in_executor(None, _update)
+
+
+async def update_task(user: dict, posicion: int, nuevo_nombre: str | None = None, nueva_fecha: str | None = None) -> bool:
+    """Update task name and/or date by its display position."""
+    if not user.get("sheets_id"):
+        return False
+
+    creds = await refresh_user_credentials(user)
+    loop = asyncio.get_running_loop()
+
+    def _update():
+        gc = gspread.authorize(creds)
+        ws = gc.open_by_key(user["sheets_id"]).sheet1
+        records = ws.get_all_records()
+        pending = [
+            (idx + 2, r)
+            for idx, r in enumerate(records)
+            if str(r.get("estado", "")).lower() == "pendiente"
+        ]
+        no_date = [(row, r) for row, r in pending if not str(r.get("fecha", "")).strip()]
+        dated = sorted(
+            [(row, r) for row, r in pending if str(r.get("fecha", "")).strip()],
+            key=lambda x: str(x[1].get("fecha", "")),
+            reverse=True,
+        )
+        sorted_pending = no_date + dated
+
+        if posicion < 1 or posicion > len(sorted_pending):
+            return False
+
+        row_idx, _ = sorted_pending[posicion - 1]
+        headers = ws.row_values(1)
+
+        if nuevo_nombre:
+            tarea_col = headers.index("tarea") + 1
+            ws.update_cell(row_idx, tarea_col, nuevo_nombre)
+        if nueva_fecha is not None:
+            fecha_col = headers.index("fecha") + 1
+            ws.update_cell(row_idx, fecha_col, nueva_fecha)
+
+        return True
+
+    return await loop.run_in_executor(None, _update)
 
 
 async def delete_event(user: dict, event_id: str) -> bool:
